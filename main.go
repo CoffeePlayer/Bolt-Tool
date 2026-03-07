@@ -30,6 +30,10 @@ type BoltResult struct {
 type BrainResult struct {
 	EnglishQ   string         `json:"english_q"`
 	OptimizedQ string         `json:"optimized_q"`
+	Primary    string         `json:"primary_tokens"`
+	Action     string         `json:"action_tokens"`
+	Context    string         `json:"context_tokens"`
+	Exclude    string         `json:"exclude_tokens"`
 	Targets    map[string]int `json:"targets"`
 	Insight    string         `json:"insight"`
 }
@@ -133,7 +137,7 @@ func initDatabases() {
 		"race condition", "refactoring", "debugging", "compilation", "interpretation", "virtualization", "containerization", "orchestration",
 		"continuous", "integration", "delivery", "pipeline", "automation", "configuration", "provisioning", "monitoring", "logging", "tracing",
 		"repository", "commit", "merge", "rebase", "branch", "checkout", "stash", "cherrypick", "conflict", "pullrequest", "review", "approval",
-		"token", "session", "cookie", "storage", "indexeddb", "localstorage", "sessionstorage", "cache", "responsive", "adaptive", "mobilefirst", 
+		"token", "session", "cookie", "storage", "indexeddb", "localstorage", "sessionstorage", "cache", "responsive", "adaptive", "mobilefirst",
 		"desktopfirst", "breakpoint", "mediaquery", "flexbox", "grid", "typography", "color", "contrast", "accessibility", "internationalization",
 		"localization", "serialization", "deserialization", "marshaling", "unmarshaling", "parsing", "lexing", "tokenization", "abstract syntax tree"
 	]`
@@ -383,37 +387,75 @@ Text: ` + query
 	return query
 }
 
-func fetchSimpleAI(prompt string) string {
-	u := b64("aHR0cHM6Ly90ZXh0LnBvbGxpbmF0aW9ucy5haS8=") + url.PathEscape(prompt)
-	resp, err := getRaw(u)
+func getVQD() string {
+	req, _ := http.NewRequest("GET", "https://duckduckgo.com/duckchat/v1/status", nil)
+	req.Header.Set("x-vqd-accept", "1")
+	req.Header.Set("User-Agent", "BoltZenithApp/62.0")
+	resp, err := httpClient.Do(req)
 	if err == nil && resp.StatusCode == 200 {
-		bodyBytes, readErr := io.ReadAll(resp.Body)
+		vqd := resp.Header.Get("x-vqd-4")
 		resp.Body.Close()
-		if readErr == nil && len(bodyBytes) > 0 {
-			return cleanHTMLAndMarkdown(string(bodyBytes), false)
-		}
+		return vqd
 	}
 	if resp != nil {
 		resp.Body.Close()
 	}
+	return ""
+}
 
-	ddgPayload := fmt.Sprintf(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":%q}]}`, prompt)
-	ddgReq, err := http.NewRequest("POST", "https://duckduckgo.com/aichat/v1/chat", strings.NewReader(ddgPayload))
-	if err == nil {
+func fetchSimpleAI(prompt string) string {
+	// 1. Pollinations AI (POST for reliability)
+	plPayload := fmt.Sprintf(`{"messages":[{"role":"user","content":%q}],"model":"openai","json":false}`, prompt)
+	plReq, _ := http.NewRequest("POST", "https://text.pollinations.ai/", strings.NewReader(plPayload))
+	plReq.Header.Set("Content-Type", "application/json")
+	plResp, err := httpClient.Do(plReq)
+	if err == nil && plResp.StatusCode == 200 {
+		body, readErr := io.ReadAll(plResp.Body)
+		plResp.Body.Close()
+		if readErr == nil && len(body) > 0 {
+			return cleanHTMLAndMarkdown(string(body), false)
+		}
+	}
+	if plResp != nil {
+		plResp.Body.Close()
+	}
+
+	// 2. DuckDuckGo AI (Token-based)
+	vqd := getVQD()
+	if vqd != "" {
+		ddgPayload := fmt.Sprintf(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":%q}]}`, prompt)
+		ddgReq, _ := http.NewRequest("POST", "https://duckduckgo.com/duckchat/v1/chat", strings.NewReader(ddgPayload))
 		ddgReq.Header.Set("Content-Type", "application/json")
+		ddgReq.Header.Set("x-vqd-4", vqd)
 		ddgReq.Header.Set("User-Agent", "BoltZenithApp/62.0")
-		ddgReq.Header.Set("x-vqd-accept", "1")
 		ddgResp, err := httpClient.Do(ddgReq)
 		if err == nil && ddgResp.StatusCode == 200 {
-			ddgBody, readErr := io.ReadAll(ddgResp.Body)
-			ddgResp.Body.Close()
-			if readErr == nil && len(ddgBody) > 0 {
-				return cleanHTMLAndMarkdown(string(ddgBody), false)
+			scanner := bufio.NewScanner(ddgResp.Body)
+			var sb strings.Builder
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "data: ") {
+					data := strings.TrimPrefix(line, "data: ")
+					if data == "[DONE]" {
+						break
+					}
+					var chunk struct {
+						Message string `json:"message"`
+					}
+					json.Unmarshal([]byte(data), &chunk)
+					sb.WriteString(chunk.Message)
+				}
 			}
-		} else if ddgResp != nil {
+			ddgResp.Body.Close()
+			if sb.Len() > 0 {
+				return cleanHTMLAndMarkdown(sb.String(), false)
+			}
+		}
+		if ddgResp != nil {
 			ddgResp.Body.Close()
 		}
 	}
+
 	return ""
 }
 
@@ -641,11 +683,27 @@ func classifyQueryIntent(query string) map[string]int {
 	return boost
 }
 
-func generateMultiQueries(baseQuery string) []string {
+func generateMultiQueries(brain BrainResult) []string {
+	baseQuery := brain.OptimizedQ
 	queries := []string{baseQuery}
 	words := strings.Fields(baseQuery)
 
-	if len(words) > 1 {
+	if brain.Primary != "" {
+		// Strict primary search
+		sq := "\"" + brain.Primary + "\" " + brain.Action + " " + brain.Context
+		if brain.Exclude != "" {
+			sq += " -" + brain.Exclude
+		}
+		queries = append(queries, sq)
+		if brain.Action != "" {
+			// Extreme precision: Primary + Action in quotes
+			aq := "\"" + brain.Primary + "\" \"" + brain.Action + "\""
+			if brain.Exclude != "" {
+				aq += " -" + brain.Exclude
+			}
+			queries = append(queries, aq)
+		}
+	} else if len(words) > 1 {
 		queries = append(queries, "\""+baseQuery+"\"")
 	}
 
@@ -656,19 +714,6 @@ func generateMultiQueries(baseQuery string) []string {
 	} else if strings.Contains(lowQ, "vs") || strings.Contains(lowQ, "best") || strings.Contains(lowQ, "compare") {
 		queries = append(queries, baseQuery+" architecture comparison")
 		queries = append(queries, baseQuery+" performance benchmark")
-	} else {
-		queries = append(queries, baseQuery+" architecture")
-		queries = append(queries, baseQuery+" internals explained")
-	}
-	var techOnly []string
-	for _, w := range words {
-		cleaned := strings.Trim(strings.ToLower(w), " ,.()[]{}\"'")
-		if massiveTechDB[cleaned] {
-			techOnly = append(techOnly, w)
-		}
-	}
-	if len(techOnly) > 0 && len(techOnly) < len(words) {
-		queries = append(queries, strings.Join(techOnly, " "))
 	}
 
 	return queries
@@ -825,6 +870,20 @@ func buildAPIQuery(raw string) string {
 		"ma": true, "się": true, "za": true, "po": true, "przez": true, "pod": true, "nad": true,
 		"jaki": true, "jaka": true, "jakie": true, "który": true, "która": true, "o": true,
 		"przy": true, "dla": true, "taki": true, "take": true, "ten": true, "ta": true,
+		"by": true, "from": true, "into": true, "onto": true, "towards": true, "away": true,
+		"up": true, "down": true, "left": true, "right": true, "top": true, "bottom": true,
+		"middle": true, "side": true, "under": true, "over": true, "between": true, "among": true,
+		"through": true, "against": true, "during": true, "before": true, "after": true, "since": true,
+		"until": true, "because": true, "as": true, "so": true,
+		"unless": true, "though": true, "although": true, "even": true, "if": true, "else": true,
+		"than": true, "more": true, "less": true, "most": true, "least": true, "better": true,
+		"worse": true, "well": true, "badly": true, "hard": true, "easy": true, "simply": true,
+		"clearly": true, "usually": true, "often": true, "sometimes": true, "never": true, "always": true,
+		"ever": true, "only": true, "almost": true, "barely": true,
+		"nearly": true, "hardly": true, "scarcely": true, "quite": true, "rather": true, "pretty": true,
+		"fairly": true, "somewhat": true, "total": true, "completely": true, "totally": true, "utterly": true,
+		"entirely": true, "absolutely": true, "fully": true, "partially": true, "partly": true, "mostly": true,
+		"mainly": true, "chiefly": true, "generally": true, "roughly": true, "approximately": true,
 	}
 
 	var techWords []string
@@ -1741,37 +1800,54 @@ Rules:
 - If the question is non-technical, provide the most relevant historical or factual data with similar precision.
 
 Question: ` + q
-
-	u := b64("aHR0cHM6Ly90ZXh0LnBvbGxpbmF0aW9ucy5haS8=") + url.PathEscape(prompt)
-	resp, err := getRaw(u)
-	if err == nil && resp.StatusCode == 200 {
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr == nil && len(bodyBytes) > 20 {
-			formattedText := formatForTerminal(string(bodyBytes))
+	plPayload := fmt.Sprintf(`{"messages":[{"role":"user","content":%q}],"model":"openai","json":false}`, prompt)
+	plReq, _ := http.NewRequest("POST", "https://text.pollinations.ai/", strings.NewReader(plPayload))
+	plReq.Header.Set("Content-Type", "application/json")
+	plResp, err := httpClient.Do(plReq)
+	if err == nil && plResp.StatusCode == 200 {
+		body, readErr := io.ReadAll(plResp.Body)
+		plResp.Body.Close()
+		if readErr == nil && len(body) > 20 {
+			formattedText := formatForTerminal(string(body))
 			fmt.Printf("\n%s SYNTEZA AI %s %s[POLLINATIONS AI]%s %s%s%s\n\n", ansiBlueLine, ansiReset, ansiMagenta, ansiReset, ansiBold, q, ansiReset)
 			fmt.Println(formattedText)
 			fmt.Println("\n" + strings.Repeat("-", 80))
 			return
 		}
 	}
-	if resp != nil {
-		resp.Body.Close()
+	if plResp != nil {
+		plResp.Body.Close()
 	}
 
 	fmt.Println("\033[33mPollinations niedostępne, próbuję DuckDuckGo AI...\033[0m")
-	ddgPayload := fmt.Sprintf(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":%q}]}`, prompt)
-	ddgReq, err := http.NewRequest("POST", "https://duckduckgo.com/aichat/v1/chat", strings.NewReader(ddgPayload))
-	if err == nil {
+	vqd := getVQD()
+	if vqd != "" {
+		ddgPayload := fmt.Sprintf(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":%q}]}`, prompt)
+		ddgReq, _ := http.NewRequest("POST", "https://duckduckgo.com/duckchat/v1/chat", strings.NewReader(ddgPayload))
 		ddgReq.Header.Set("Content-Type", "application/json")
+		ddgReq.Header.Set("x-vqd-4", vqd)
 		ddgReq.Header.Set("User-Agent", "BoltZenithApp/62.0")
-		ddgReq.Header.Set("x-vqd-accept", "1")
 		ddgResp, err := httpClient.Do(ddgReq)
 		if err == nil && ddgResp.StatusCode == 200 {
-			ddgBody, readErr := io.ReadAll(ddgResp.Body)
+			scanner := bufio.NewScanner(ddgResp.Body)
+			var sb strings.Builder
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "data: ") {
+					data := strings.TrimPrefix(line, "data: ")
+					if data == "[DONE]" {
+						break
+					}
+					var chunk struct {
+						Message string `json:"message"`
+					}
+					json.Unmarshal([]byte(data), &chunk)
+					sb.WriteString(chunk.Message)
+				}
+			}
 			ddgResp.Body.Close()
-			if readErr == nil && len(ddgBody) > 10 {
-				formattedText := formatForTerminal(string(ddgBody))
+			if sb.Len() > 10 {
+				formattedText := formatForTerminal(sb.String())
 				fmt.Printf("\n%s SYNTEZA AI %s %s[DUCKDUCKGO AI]%s %s%s%s\n\n", ansiBlueLine, ansiReset, ansiMagenta, ansiReset, ansiBold, q, ansiReset)
 				fmt.Println(formattedText)
 				fmt.Println("\n" + strings.Repeat("-", 80))
@@ -1796,7 +1872,8 @@ Rules:
 3. EXTRACT absolute critical keywords: Tech stack names, error codes, specific functions/methods, and architectural patterns.
 4. Translate all concepts to standard English industry terminology.
 5. If searching for a person or specific tool, include the exact name and category.
-6. Max 6-8 words. Output ONLY keywords separated by spaces. No punctuation.
+6. DO NOT add words that are not present in the original query unless essential for context.
+7. Max 4-6 words. Output ONLY keywords separated by spaces. No punctuation.
 
 Input: ` + query
 
@@ -1844,19 +1921,23 @@ Input: ` + query
 }
 
 func preSearchBrain(query string) BrainResult {
-	prompt := `You are the Brain of a high-performance technical search engine. 
-Analyze the input and return ONLY a valid JSON object.
+	prompt := `You are the ultimate technical tokenization engine. Analyze the technical search query and return ONLY a valid JSON object.
 
 Input: "` + query + `"
 
 Requirements:
-1. "english_q": Translate the input to perfect technical English.
-2. "optimized_q": Extract 4-6 most critical technical keywords for search (GitHub/SO).
-3. "targets": A map of sources to priority score (0-100). Sources: "GITHUB", "STACK OVERFLOW", "HACKER NEWS", "DEV.TO", "WIKIPEDIA".
-4. "insight": A short (max 12 words) technical insight or advice related to the topic.
+1. "english_q": Translate/Refine to professional technical English.
+2. "optimized_q": 3-6 words representing ONLY the core technical intent provided in the input.
+3. "primary_tokens": The absolute core technology/library/language mentioned in the input.
+4. "action_tokens": The specific intent or error mentioned in the input.
+5. "context_tokens": Constraints mentioned like "arm64", "v1.23", "production", "linux".
+6. "exclude_tokens": Technical terms the user explicitly wants to avoid.
+7. "targets": Map of sources (GITHUB, STACK OVERFLOW, HACKER NEWS, DEV.TO, WIKIPEDIA) to priority (0-100).
+8. "insight": One sentence of high-level expert advice.
+9. CRITICAL: DO NOT add extra keywords that were not in the user query (e.g. if I type 'csharp' do not add 'async' unless I asked for it).
 
 JSON Format:
-{"english_q": "...", "optimized_q": "...", "targets": {"GITHUB": 80, ...}, "insight": "..."}
+{"english_q": "...", "optimized_q": "...", "primary_tokens": "...", "action_tokens": "...", "context_tokens": "...", "exclude_tokens": "...", "targets": {"GITHUB": 80, ...}, "insight": "..."}
 JSON Output: `
 
 	parseBrain := func(body string) BrainResult {
@@ -1873,19 +1954,11 @@ JSON Output: `
 		return BrainResult{}
 	}
 
-	u := b64("aHR0cHM6Ly90ZXh0LnBvbGxpbmF0aW9ucy5haS8=") + url.PathEscape(prompt)
-	resp, err := getRaw(u)
-	if err == nil && resp.StatusCode == 200 {
-		if bodyBytes, err := io.ReadAll(resp.Body); err == nil {
-			resp.Body.Close()
-			if res := parseBrain(string(bodyBytes)); res.EnglishQ != "" {
-				return res
-			}
-		}
+	aiResponse := fetchSimpleAI(prompt)
+	if res := parseBrain(aiResponse); res.EnglishQ != "" {
+		return res
 	}
-	if resp != nil {
-		resp.Body.Close()
-	}
+
 	return BrainResult{
 		EnglishQ:   query,
 		OptimizedQ: query,
@@ -1969,14 +2042,86 @@ func classifyVideoCategory(title string, desc string) string {
 	dl := strings.ToLower(desc)
 	combined := tl + " " + dl
 
-	tutorialSignals := []string{"tutorial", "how to", "step by step", "beginner", "learn", "guide", "getting started", "from scratch", "walkthrough", "explained", "for beginners", "introduction to", "basics", "fundamentals", "course", "lesson"}
-	crashCourseSignals := []string{"crash course", "full course", "complete course", "in one video", "all you need", "masterclass", "bootcamp", "zero to hero", "complete guide"}
-	comparisonSignals := []string{"vs", "versus", "compared", "comparison", "which is better", "differences", "pros and cons", "benchmark"}
-	liveCodingSignals := []string{"live coding", "code along", "build with me", "let's build", "coding challenge", "project tutorial", "real world", "from zero"}
-	talkSignals := []string{"conference", "keynote", "talk", "presentation", "meetup", "summit", "panel", "fireside", "interview"}
-	officialSignals := []string{"official", "documentation", "release", "announcement", "changelog", "what's new", "update"}
-	reviewSignals := []string{"review", "honest review", "opinion", "worth it", "should you", "my experience"}
-	advancedSignals := []string{"advanced", "senior", "architecture", "deep dive", "internals", "expert", "mastery", "in depth", "low level", "performance optimization", "security audit", "under the hood", "production ready"}
+	tutorialSignals := []string{
+		"tutorial", "how to", "step by step", "beginner", "learn", "guide", "getting started", "from scratch", "walkthrough", "explained", "for beginners", "introduction to", "basics", "fundamentals", "course", "lesson",
+		"poradnik", "kurs", "lekcja", "przewodnik", "wstęp", "wprowadzenie", "krok po kroku", "od zera", "podstawy", "nauka", "zrozumieć", "opanować", "manual", "handbook", "primer", "bootcamp", "training", "exercise",
+		"practice", "workshop", "lab", "assignment", "homework", "example", "sample", "demo", "quickstart", "cheat sheet", "cheatsheet", "roadmap", "pathway", "curriculum", "syllabus", "module", "chapter", "section",
+		"part 1", "part 2", "series", "playlist", "complete guide", "ultimate guide", "comprehensive guide", "mastering", "deep dive", "internals", "architecture", "design patterns", "best practices", "clean code",
+		"solid", "tdd", "testing", "debugging", "deployment", "hosting", "production", "real world", "application", "project", "build a", "create a", "make a", "developing", "coding", "programming", "scripting",
+		"automation", "integration", "api", "database", "frontend", "backend", "fullstack", "devops", "cloud", "serverless", "microservices", "docker", "kubernetes", "git", "github", "setup", "install", "config",
+		"refactoring", "optimization", "performance", "security", "exploit", "penetration", "hacker", "white hat", "black hat", "defense", "mitigation", "incident", "response", "forensics", "malware", "analysis", "reverse engineering",
+		"cryptography", "blockchain", "smart contract", "ethereum", "bitcoin", "nft", "dao", "web3", "ai", "machine learning", "deep learning", "neural network", "transformer", "bert", "gpt", "model", "inference", "training",
+		"dataset", "data science", "analytics", "visualization", "bi", "data warehouse", "data lake", "data pipeline", "etl", "scraping", "crawler", "browser", "engine", "parser", "compiler", "interpreter", "runtime",
+	}
+	crashCourseSignals := []string{
+		"crash course", "full course", "complete course", "in one video", "all you need", "masterclass", "bootcamp", "zero to hero", "complete guide",
+		"wszystko w jednym", "cały kurs", "kompletny kurs", "szybki kurs", "intensywny kurs", "skondensowana wiedza", "mastery", "full tutorial", "marathon", "mega course", "giant course", "long video", "everything you need",
+		"1 hour", "2 hours", "3 hours", "5 hours", "10 hours", "full project", "end to end", "e2e", "comprehensive", "all-in-one", "ultimate", "absolute", "complete walkthrough", "full implementation", "build from scratch",
+		"from start to finish", "from A to Z", "beginner to pro", "junior to senior", "zero to mastery", "the complete", "the ultimate", "the masterclass", "full series", "box set", "compilation", "collection", "bundle",
+		"speedrun", "fast track", "accelerated", "intensive", "power course", "essential", "core", "foundation", "pro guide", "expert guide", "senior guide", "architect guide", "lead guide", "full stack guide", "backend guide",
+		"frontend guide", "mobile guide", "game dev guide", "ai guide", "data science guide", "devops guide", "security guide", "cloud guide", "blockchain guide", "web3 guide", "soft skills guide", "career guide", "job guide",
+		"the complete series", "the whole course", "the entire guide", "everything inklusiv", "all topics", "comprehensive training", "one stop shop", "no experience needed", "zero background", "start to finish guide", "comprehensive walk",
+		"ultimate masterclass", "the final guide", "all in one place", "the only video", "the primary course", "the fundamental course", "the core guide", "the absolute guide", "the essential guide", "the professional guide",
+		"the enterprise guide", "the scale guide", "the performance guide", "the optimization guide", "the security guide", "the architecture guide", "the internals guide", "the deep dive guide", "the low level guide",
+	}
+	comparisonSignals := []string{
+		"vs", "versus", "compared", "comparison", "which is better", "differences", "pros and cons", "benchmark", "performance", "speed", "test",
+		"porównanie", "kontra", "co lepsze", "różnice", "za i przeciw", "wady i zalety", "recenzja", "opinia", "ranking", "top 5", "top 10", "best of", "winner", "loser", "choice", "selection", "decision", "tradeoffs",
+		"alternatives", "options", "competitors", "market share", "popularity", "trends", "stack", "tools", "frameworks", "libraries", "languages", "databases", "platforms", "services", "providers", "hosting", "cloud",
+		"rust vs go", "react vs vue", "angular vs react", "next vs nuxt", "python vs r", "java vs c#", "sql vs nosql", "docker vs podman", "k8s vs swarm", "aws vs azure", "gcp vs aws", "terraform vs pulumi", "mac vs pc",
+		"ios vs android", "native vs cross", "flutter vs rn", "swift vs kotlin", "php vs node", "fastapi vs flask", "django vs rails", "tailwind vs bootstrap", "css vs sass", "vite vs webpack", "npm vs yarn", "pnpm vs npm",
+		"better than", "worse than", "faster than", "slower than", "easier than", "harder than", "cheaper than", "pricier than", "best framework", "best language", "best tool", "best library", "best database", "best cloud",
+		"top choice", "number one", "the winner is", "who wins", "showdown", "face off", "battle", "clash", "fight", "competition", "rivalry", "matchup", "head to head", "split", "divide", "alternatives to", "replaces",
+	}
+	liveCodingSignals := []string{
+		"live coding", "code along", "build with me", "let's build", "coding challenge", "project tutorial", "real world", "from zero",
+		"kodowanie na żywo", "buduj ze mną", "projekt od zera", "wyzwanie", "praktyka", "realny projekt", "live stream", "recorded live", "unfiltered", "unscripted", "raw coding", "authentic", "problem solving", "live debug",
+		"build together", "pair programming", "interactive", "qa session", "ask me anything", "ama", "live demo", "live workshop", "hands on", "practical coding", "watch me code", "code marathon", "coding session", "hackathon",
+		"build a saas", "build a clone", "build from prototype", "from idea to production", "live refactor", "live migration", "live deploy", "live fix", "live audit", "live security", "live test", "live devops", "live cloud",
+		"build in public", "indie hacker", "startup live", "mvp build", "rapid prototyping", "fast coding", "clean coding live", "senior coding live", "lead coding live", "expert coding live", "architect coding live",
+		"raw stream", "uncut", "unmodified", "unedited", "live problem", "solving live", "coding in real time", "real time dev", "dev diary", "dev log", "coding vlog", "stream highlight", "stream session", "code and chill",
+		"lofi hip hop", "background music", "coworking", "study with me", "focus session", "deep work", "deep focus", "coding music", "dark mode coding", "night coding", "chill coding", "relaxing coding", "productive coding",
+		"focusing", "quiet time", "pomodoro", "study session", "work with me", "day in the life", "morning routine", "night routine", "home office", "desk setup", "minimalist", "gaming setup", "setup tour", "pc build",
+	}
+	talkSignals := []string{
+		"conference", "keynote", "talk", "presentation", "meetup", "summit", "panel", "fireside", "interview", "discussion", "debate", "speech", "lecture",
+		"konferencja", "prezentacja", "spotkanie", "wywiad", "dyskusja", "panel", "przemówienie", "wykład", "seminarium", "webinar", "podcast", "event", "gathering", "forum", "symposium", "convention", "expo", "trade show",
+		"devconf", "con", "summit 2024", "summit 2025", "google io", "apple wwdc", "microsoft build", "aws re:invent", "kubecon", "dockercon", "rustconf", "gophercon", "pycon", "jsconf", "reactconf", "vueconf", "angularconf",
+		"defcon", "blackhat", "security conference", "ai summit", "ml conference", "data summit", "cloud summit", "devops days", "agile tour", "scrum gathering", "tech talk", "tech presentation", "engineering talk", "architect talk",
+		"fosdem", "linuxcon", "oscon", "google cloud next", "oracle code", "ibm think", "re:invent", "ignite", "build", "wwdc", "io", "fb developer", "f8", "collision", "web summit", "slush", "sxsw", "ces", "computex", "ifa",
+		"e3", "gamescom", "gdc", "siggraph", "iclr", "nips", "neurips", "cvpr", "eccv", "iccv", "aaai", "ijcai", "emnlp", "acl", "naacl", "icml", "kdd", "sigir", "www", "infocom", "sigcomm", "mobicom", "sensys", "asplos",
+	}
+	officialSignals := []string{
+		"official", "documentation", "release", "announcement", "changelog", "what's new", "update", "roadmap", "status", "report", "brief", "memo", "guide",
+		"oficjalna", "dokumentacja", "wydanie", "ogłoszenie", "zmiany", "nowości", "aktualizacja", "plany", "raport", "informacja", "przewodnik", "instrukcja", "oficjalny kanał", "official channel", "official video", "by the founders",
+		"core team", "maintainers", "community update", "foundation update", "standard", "specification", "rfc", "iso", "ieee", "w3c", "ecma", "proposal", "draft", "v1.0", "v2.0", "v3.0", "major release", "minor release",
+		"patch release", "official demo", "official teaser", "official trailer", "official launch", "official event", "official partnership", "official integration", "official support", "official statement", "official news",
+		"presse", "media", "pr", "prm", "briefing", "official blog", "official tweet", "official post", "official repo", "original source", "authorized", "certified", "validated", "verified source", "legit", "authentic source",
+		"official app", "official site", "official page", "landingspage", "product page", "features list", "pricing", "plans", "enterprise edition", "community edition", "professional edition", "ultimate edition", "free tier",
+		"standardization", "blueprint", "canonical source", "official documentation", "main docs", "official faq", "official wiki", "official forums", "official support", "official help", "official contact", "official team",
+		"official partners", "official affiliates", "official distributors", "official vendors", "official store", "official merchandise", "official podcast", "official newsletter", "official github", "official repo",
+	}
+	reviewSignals := []string{
+		"review", "honest review", "opinion", "worth it", "should you", "my experience", "my thoughts", "evaluation", "score", "grade", "rating", "verdict",
+		"recenzja", "szczera opinia", "warto", "czy warto", "moje doświadczenie", "moja opinia", "testujemy", "sprawdzamy", "używamy", "analiza", "werdykt", "ocena", "podsumowanie", "final thoughts", "long term review",
+		"after 1 year", "after 6 months", "after 1 month", "daily driver", "switched to", "i quit", "why i left", "why i moved", "why i chose", "why i use", "comparison review", "hands on review", "unboxing", "first look",
+		"initial impressions", "deep review", "expert review", "professional review", "user review", "community review", "honest take", "unbiased review", "critical review", "detailed review", "quick review", "summary review",
+		"the truth", "bad parts", "good parts", "annoying parts", "limitations", "weaknesses", "strengths", "capabilities", "features review", "performance review", "ux review", "ui review", "dx review", "developer review",
+		"real review", "neutral review", "objective review", "subjective review", "personal review", "final verdict", "conclusion", "should i buy", "should i use", "is it dead", "is it obsolete", "is it future proof",
+		"long term evaluation", "retrospective review", "year in review", "state of the union", "comprehensive analysis", "detailed evaluation", "pros and cons analysis", "technical comparison", "feature by feature",
+		"benchmark results", "performance labs", "test results", "real world testing", "case study", "user experience report", "developer experience survey", "industry review", "market analysis", "expert opinion",
+	}
+	advancedSignals := []string{
+		"advanced", "senior", "architecture", "deep dive", "internals", "expert", "mastery", "in depth", "low level", "performance optimization", "security audit", "under the hood", "production ready",
+		"zaawansowane", "ekspert", "architektura", "szczegółowo", "wnętrze", "niskopoziomowy", "optymalizacja", "produkcyjne", "profesjonalne", "senior dev", "lead dev", "staff dev", "principal dev", "cto level", "engineering",
+		"distributed systems", "concurrency", "parallelism", "scalability", "resilience", "high availability", "fault tolerance", "observability", "metrics", "tracing", "logging", "memory management", "garbage collection",
+		"jit compiler", "interpreter", "runtime internals", "kernel dev", "drivers", "embedded systems", "iot architecture", "cloud native", "kubernetes internals", "docker internals", "database internals", "query optimization",
+		"indexing strategies", "security exploitation", "reverse engineering", "binary analysis", "cryptography", "math for devs", "algorithms analysis", "big o", "data structures dive", "designing data intensive", "clean architecture",
+		"microservices architecture", "event driven", "cqrs", "event sourcing", "domain driven design", "ddd", "hexagonal architecture", "onion architecture", "modular monolith", "distributed database", "paxos", "raft", "consensus",
+		"byzantine fault tolerance", "bft", "sharding", "partitioning", "replication", "consistency", "availability", "partition tolerance", "cap theorem", "acid vs base", "stateless architecture", "edge computing", "serverless internals",
+		"assembly language", "machine code", "binary format", "executable internals", "linking and loading", "memory layout", "calling conventions", "stack frames", "heap allocation algorithms", "cache locality", "simd",
+		"vectorization", "parallel processing", "multithreading models", "lock free programming", "atomic operations", "memory fences", "wait free data structures", "distributed consensus", "paxos", "raft", "zab", "viewstamped",
+	}
 
 	advScore := 0
 	for _, s := range advancedSignals {
@@ -2183,6 +2328,28 @@ func scoreYouTubeItem(rawQ string, title string, desc string, author string, vie
 		"coding with john": 300, "bro code": 300, "caleb curry": 250,
 		"hussein nasser": 350, "arjan codes": 300, "anthonygg": 250,
 		"dreams of code": 300, "typecraft": 250, "devops toolkit": 300,
+		"coding addict": 300, "online tutorials": 250, "kevin powell": 300,
+		"codevolution": 300, "developedbyed": 300, "james q quick": 250,
+		"joshua morony": 250, "leigieber": 250, "william lin": 350,
+		"erik dot dev": 250, "coder coder": 250, "designcourse": 300,
+		"flux academy": 300, "paddy gulas": 250, "gary explains": 300,
+		"the nexus": 250, "low level learning": 350, "hackersploit": 350,
+		"networkchuck": 400, "david bombal": 400, "null byte": 300,
+		"infosec pat": 300, "the cyber mentor": 400, "ippsec": 400,
+		"liveoverflow": 400, "stok": 300, "nahamsec": 350,
+		"john hammond": 450, "computer science": 300, "mit opencourseware": 500,
+		"stanford": 450, "harvard cs50": 500, "edx": 350,
+		"coursera": 350, "udemy": 300, "pluralsight": 350,
+		"eggheadio": 350, "level up tutorials": 300, "wes bos": 350,
+		"scrimba": 300, "frontend masters": 450, "dotconferences": 400,
+		"ndc conferences": 400, "gotoconferences": 400, "oreilly": 350,
+		"google developers": 450, "android developers": 400, "apple developer": 400,
+		"microsoft developer": 400, "aws wales": 350, "hashicorp": 400,
+		"docker": 400, "kubernetes": 400, "cncf": 450,
+		"linux foundation": 450, "red hat": 400, "canonical": 350,
+		"mongodb": 350, "elastic": 350, "redis": 350,
+		"confluent": 350, "databricks": 350, "snowflake": 350,
+		"cloudflare": 400, "digitalocean": 350, "linode": 300,
 	}
 	authorLower := strings.ToLower(author)
 	for channel, bonus := range knownChannels {
@@ -2229,7 +2396,16 @@ func scoreYouTubeItem(rawQ string, title string, desc string, author string, vie
 		}
 	}
 
-	clickbaitSignals := []string{"you won't believe", "shocking", "insane", "mind blowing", "#shorts", "tiktok", "reaction", "prank"}
+	clickbaitSignals := []string{
+		"you won't believe", "shocking", "insane", "mind blowing", "#shorts", "tiktok", "reaction", "prank", "gone wrong", "gone sexual", "emotional", "must watch", "unbelievable",
+		"niesamowite", "nie uwierzysz", "szok", "szokujące", "petarda", "masakra", "reakcja", "żart", "prank", "śmieszne", "fail", "epic fail", "clickbait", "thumbnail", "giveaway",
+		"free money", "make money", "passive income", "rich quickly", "scam", "shilling", "pump and dump", "crypto moon", "100x gem", "don't miss", "last chance", "hurry up", "limited time",
+		"revealed", "exposed", "truth about", "hidden secret", "secret hack", "you need to see this", "the wait is over", "finally happened", "it's over", "i'm sorry", "we need to talk",
+		"why i quit", "i'm leaving", "my biggest mistake", "don't do this", "stop doing this", "never do this", "the dark side", "the ugly truth", "nightmare", "horror", "scary",
+		"ghost", "mystery", "solved", "leak", "rumor", "confirmed", "official trailer", "teaser", "leak", "stolen", "hacked", "breach", "warning", "danger", "deadly", "fatal", "dangerous",
+		"extreme", "wild", "crazy", "unhinged", "epic", "legendary", "historic", "huge", "massive", "giant", "enormous", "incredible", "omg", "wow", "lol", "lmao", "rofl", "xd", "f", "rip", "rip coding", "dead",
+		"killer", "savior", "hero", "villain", "monster", "beast", "god", "king", "queen", "lord", "master", "slave", "war", "battle", "clash", "fight", "struggle", "success", "failure", "win", "loss", "victory", "defeat",
+	}
 	for _, cb := range clickbaitSignals {
 		if strings.Contains(tLower, cb) {
 			score -= 500
@@ -2396,7 +2572,7 @@ func fetchYouTube(rawQ string, ch chan<- BoltResult, wg *sync.WaitGroup) {
 			desc = string([]rune(desc)[:200]) + "..."
 		}
 		if desc == "" {
-			desc = "[Brak opisu]"
+			desc = "[No description]"
 		}
 
 		catTag := ""
@@ -2449,7 +2625,7 @@ func printResultLive(res BoltResult, index int) {
 	}
 
 	if res.CodeSnippet != "" {
-		fmt.Println("\033[42;30m Fragment kodu: \033[0m")
+		fmt.Println("\033[42;30m Code snippet: \033[0m")
 		codeLines := strings.Split(res.CodeSnippet, "\n")
 		for i, line := range codeLines {
 			if i > 20 {
@@ -2470,14 +2646,14 @@ func main() {
 		clear()
 		fmt.Print("\033[33m")
 		fmt.Println(`
-██████╗  ██████╗ ██╗  ████████╗    ████████╗ ██████╗  ██████╗ ██╗    
-██╔══██╗██╔═══██╗██║  ╚══██╔══╝    ╚══██╔══╝██╔═══██╗██╔═══██╗██║    
-██████╔╝██║   ██║██║     ██║          ██║   ██║   ██║██║   ██║██║    
-██╔══██╗██║   ██║██║     ██║          ██║   ██║   ██║██║   ██║██║    
+██████╗  ██████╗ ██╗  ████████╗    ████████╗ ██████╗  ██████╗ ██╗
+██╔══██╗██╔═══██╗██║  ╚══██╔══╝    ╚══██╔══╝██╔═══██╗██╔═══██╗██║
+██████╔╝██║   ██║██║     ██║          ██║   ██║   ██║██║   ██║██║
+██╔══██╗██║   ██║██║     ██║          ██║   ██║   ██║██║   ██║██║
 ██████╔╝╚██████╔╝███████╗██║          ██║   ╚██████╔╝╚██████╔╝███████╗
 ╚═════╝  ╚═════╝ ╚══════╝╚═╝          ╚═╝    ╚═════╝  ╚═════╝ ╚══════╝`)
 		fmt.Print("\033[0m")
-		fmt.Println("\n\033[32m[Version: BOLT Tool 2.0 Master]\033[0m")
+		fmt.Println("\n\033[32m[Version: BOLT Tool 2.1 Master]\033[0m")
 		fmt.Println("Author: Coffee_Player | GitHub: https://github.com/CoffeePlayer")
 		fmt.Println("\n[1] Auto Research (GitHub, StackOverflow, HackerNews, Dev.to, Wiki and more)")
 		fmt.Println("[2] Target: Strict Code-Only (Discard results without code!)")
@@ -2533,20 +2709,13 @@ func main() {
 		strictCodeMode := (selectionStr == "2")
 		isYouTubeOnly := (selectionStr == "7")
 
-		fmt.Println("\n\033[36mInicjalizacja systemu...\033[0m")
-
 		correctedQ := autoCorrect(rawQ)
 		complexity := classifyComplexity(correctedQ)
 
 		var brain BrainResult
 		if complexity != "EASY" {
-			fmt.Printf("\033[35mAnalizowanie (Poziom: %s)...\033[0m\n", complexity)
 			brain = preSearchBrain(correctedQ)
-			if brain.Insight != "" {
-				fmt.Printf("\033[32mAnaliza: %s\033[0m\n", brain.Insight)
-			}
 		} else {
-			fmt.Println("\033[32mWykryto proste zapytanie.\033[0m")
 			brain = BrainResult{
 				EnglishQ:   fastTranslate(correctedQ),
 				OptimizedQ: fastTranslate(correctedQ),
@@ -2555,11 +2724,9 @@ func main() {
 			}
 		}
 
-		englishQ := brain.EnglishQ
 		optimizedQ := brain.OptimizedQ
 
-		fmt.Printf("\033[90mInterpretacja: %s\033[0m\n", englishQ)
-		fmt.Printf("\033[32mKluczowe słowa: %s\033[0m\n", optimizedQ)
+		fmt.Printf("\033[32mKeywords: %s\033[0m\n", optimizedQ)
 
 		var targets []string
 		type kv struct {
@@ -2584,7 +2751,7 @@ func main() {
 			targets = []string{"STACK OVERFLOW", "GITHUB"}
 		}
 
-		multiQueries := generateMultiQueries(optimizedQ)
+		multiQueries := generateMultiQueries(brain)
 		ghQueries := generateGitHubQueries(optimizedQ)
 
 		resultsChan := make(chan BoltResult, 500)
@@ -2596,11 +2763,7 @@ func main() {
 			wg.Add(1)
 			go fetchYouTube(optimizedQ, resultsChan, &wg)
 		} else if selectionStr == "1" || strictCodeMode {
-			fmt.Printf("\033[33mRouter aktywny. Cele: %s\033[0m\n", strings.Join(targets, " + "))
 		}
-
-		fmt.Println("\033[36mAnalizowanie wyników...\033[0m")
-		fmt.Println(strings.Repeat("=", 80))
 
 		executeTarget := func(target, query string) {
 			priority := brain.Targets[target]
@@ -2696,7 +2859,6 @@ func main() {
 				printResultLive(res, i)
 
 				if sessionLang != "" && sessionLang != "English" {
-					fmt.Printf("\033[35mAutomatyczne tłumaczenie na %s...\033[0m\n", sessionLang)
 					translated := fastTranslateText(res.Body, sessionLang)
 					fmt.Printf("\033[32m[%s]:\033[0m %s\n", strings.ToUpper(sessionLang), translated)
 					fmt.Println(strings.Repeat("-", 80))
@@ -2725,13 +2887,6 @@ func fastTranslateText(text string, targetLang string) string {
 	if text == "" || targetLang == "" {
 		return text
 	}
-
-	runes := []rune(text)
-	if len(runes) > 450 {
-		runes = runes[:450]
-	}
-	cleanText := string(runes)
-
 	langCode := "en"
 	switch strings.ToLower(targetLang) {
 	case "polish", "polski":
@@ -2743,15 +2898,31 @@ func fastTranslateText(text string, targetLang string) string {
 	case "spanish", "hiszpański":
 		langCode = "es"
 	}
+	runes := []rune(text)
+	chunkSize := 450
+	var finalResult []string
+	for i := 0; i < len(runes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunk := string(runes[i:end])
+		translatedChunk := callMyMemory(chunk, langCode)
+		finalResult = append(finalResult, translatedChunk)
+	}
+	return strings.Join(finalResult, " ")
+}
+
+func callMyMemory(cleanText, langCode string) string {
 	u := "https://api.mymemory.translated.net/get?q=" + url.QueryEscape(cleanText) + "&langpair=en|" + langCode
 	resp, err := httpClient.Get(u)
-	if err != nil || resp.StatusCode != 200 {
-		if resp != nil {
-			resp.Body.Close()
-		}
+	if err != nil {
 		return cleanText
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return cleanText
+	}
 	var res struct {
 		ResponseData struct {
 			TranslatedText string `json:"translatedText"`
